@@ -1,0 +1,124 @@
+name: Main Branch Pipeline
+on:
+  workflow_call:
+    inputs:
+      componentName:
+        required: true
+        type: string
+      SONAR_CLASS_PATH:
+        required: true
+        type: string
+    secrets:
+      NR_API_KEY:
+        required: true
+      VAULT_TOKEN:
+        required: true
+
+run-name: ${{ github.sha }} | ${{ github.event.head_commit.message }}
+jobs:
+  UNIT-TESTS:
+    runs-on: self-hosted
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          echo npm test
+
+  SECURITY-SCANS:
+    runs-on: self-hosted
+    needs: UNIT-TESTS
+    steps:
+      - uses: actions/checkout@v4
+      - name: Import SonarQube Secrets
+        id: sonarqube
+        uses: hashicorp/vault-action@v2
+        with:
+          url: http://vault-internal.rdevopsb81.online:8200
+          token: ${{ secrets.VAULT_TOKEN }}
+          secrets: |
+            infra-secrets/data/sonarqube username | sonar_user ;
+            infra-secrets/data/sonarqube password | sonar_pass ;
+      - name: Maven Compile for Java
+        run: |
+          if [ ${{ inputs.componentName }} == "shipping" ]; then
+            echo mvn clean compile
+          fi
+      - name: Code Quality Checks
+        run: echo /sonar-scanner/sonar-scanner-6.1.0.4477-linux-x64/bin/sonar-scanner -Dsonar.host.url=http://sonarqube-internal.rdevopsb81.online:9000 -Dsonar.login=${{ steps.sonarqube.outputs.sonar_user }} -Dsonar.password=${{ steps.sonarqube.outputs.sonar_pass }} -Dsonar.qualitygate.wait=true -Dsonar.projectKey=${{ inputs.componentName }} ${{ inputs.SONAR_CLASS_PATH }}
+      - name: SAST Scan
+        run: echo SAST Scan
+      - name: SCA Check
+        run: echo SCA Check
+
+
+  build:
+    runs-on: self-hosted
+    needs: SECURITY-SCANS
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          aws ecr get-login-password --region us-east-1 | docker login --username AWS --password-stdin 897722697588.dkr.ecr.us-east-1.amazonaws.com
+          if [ ${{ inputs.componentName }} == "shipping" ]; then
+            curl -v -L -O https://download.newrelic.com/newrelic/java-agent/newrelic-agent/current/newrelic-java.zip
+            unzip newrelic-java.zip
+          fi
+          e=$(aws ecr describe-images --repository-name roboshop-${{ inputs.componentName }} | grep ${{ github.sha }} | wc -l)
+          if [ $e -eq 0 ]; then
+            docker build --build-arg NR_API_KEY=${{ secrets.NR_API_KEY }} -t 897722697588.dkr.ecr.us-east-1.amazonaws.com/roboshop-${{ inputs.componentName }}:${{ github.sha }} .
+            # We will check the security issues & we will stop here itself
+            #trivy image 897722697588.dkr.ecr.us-east-1.amazonaws.com/roboshop-${{ inputs.componentName }}:${{ github.sha }} -s HIGH,CRITICAL --exit-code 1
+            docker push 897722697588.dkr.ecr.us-east-1.amazonaws.com/roboshop-${{ inputs.componentName }}:${{ github.sha }}
+          fi
+
+
+  DEV:
+    runs-on: self-hosted
+    needs: build
+    environment: DEV
+    steps:
+      - uses: actions/checkout@v4
+        name: CheckOut Code
+      - run: |
+          aws eks update-kubeconfig --name dev-eks
+          PASS=$(kubectl get secrets argocd-initial-admin-secret -n argocd --template={{.data.password}} | base64 --decode)
+          argocd login argocd-dev.rdevopsb81.online --username admin --password $PASS --insecure --skip-test-tls --grpc-web
+        name: ArgoCD login
+      - run: |
+          argocd app create ${{ inputs.componentName }} --repo https://github.com/raghudevopsb81/roboshop-helm.git  --path . --dest-namespace default --dest-server https://kubernetes.default.svc  --values env-dev/${{ inputs.componentName }}.yaml  --helm-set COMMIT_ID=${{ github.sha }} --upsert
+          argocd app sync ${{ inputs.componentName }}
+
+  QA:
+    runs-on: self-hosted
+    needs: DEV
+    environment: QA
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          echo
+
+  E2E-TESTS:
+    runs-on: self-hosted
+    needs: QA
+    environment: QA
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          echo
+
+  UAT:
+    runs-on: self-hosted
+    needs: QA
+    environment: E2E-TESTS
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          echo
+
+  PROD:
+    runs-on: self-hosted
+    needs: UAT
+    environment: PROD
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          echo
+##
